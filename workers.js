@@ -1,5 +1,5 @@
-// ====== 【核心安全配置】仅在此处修改允许的域名 ======
-const ALLOWED_DOMAIN = 'cors.Your_domain.com'; // ← 需要修改成你的域名
+// ====== 【核心安全配置】在此处修改你的域名 ======
+const ALLOWED_DOMAIN = 'cors.your_domain.com';
 
 addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request));
@@ -31,12 +31,10 @@ async function handleRequest(request) {
 
   // ====== 【根路径处理】 ======
   if (url.pathname === '/' && !url.searchParams.get('url')) {
-    // 动态生成安全域名变量
     const DOMAIN_ORIGIN = `https://${ALLOWED_DOMAIN}`;
     
-    // 注入当前域名到HTML模板
-    const htmlContent = `
-<!DOCTYPE html>
+    // 注入当前域名到HTML模板（保持原结构不变）
+    const htmlContent = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -200,8 +198,7 @@ async function handleRequest(request) {
     </ul>
   </div>
 </body>
-</html>`.replace(/\${DOMAIN_ORIGIN}/g, DOMAIN_ORIGIN); // 安全替换动态变量
-
+</html>`;
     return new Response(htmlContent, {
       status: 200,
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
@@ -220,6 +217,7 @@ async function handleRequest(request) {
       return new Response('Security Error: Cannot proxy own domain', { status: 403 });
     }
 
+    // ====== 【关键修复】添加HTML资源重写功能 ======
     const proxyRequest = new Request(targetUrl, {
       method: request.method,
       headers: request.headers,
@@ -227,27 +225,112 @@ async function handleRequest(request) {
     });
 
     const response = await fetch(proxyRequest);
-    const newHeaders = new Headers(response.headers);
     
-    // 添加CORS头
-    newHeaders.set('Access-Control-Allow-Origin', '*');
-    newHeaders.set('Access-Control-Allow-Methods', '*');
-    newHeaders.set('Access-Control-Allow-Headers', '*');
-    
-    // 源码模式处理
-    if (url.searchParams.get('text') === 'true') {
-      const text = await response.text();
-      return new Response(text, { 
+    // 非HTML内容直接返回（PDF等文件）
+    if (!response.headers.get('content-type')?.includes('text/html')) {
+      // 对非HTML文件仅转换为绝对路径（不添加代理）
+      const newHeaders = new Headers(response.headers);
+      newHeaders.set('Access-Control-Allow-Origin', '*');
+      return new Response(response.body, { 
         status: response.status, 
         headers: newHeaders 
       });
     }
 
-    return new Response(response.body, {
+    // ====== 【核心重写逻辑】 ======
+    const html = await response.text();
+    const rewrittenHtml = rewriteHtmlResources(html, targetUrl, url.origin);
+    
+    // 构建重写后的响应
+    const newHeaders = new Headers(response.headers);
+    newHeaders.set('Content-Length', String(rewrittenHtml.length));
+    newHeaders.set('Access-Control-Allow-Origin', '*');
+    
+    return new Response(rewrittenHtml, {
       status: response.status,
       headers: newHeaders
     });
   } catch (e) {
     return new Response(`Proxy Error: ${e.message}`, { status: 502 });
   }
+}
+
+// ====== 【核心功能】HTML资源自动重写函数 ======
+/**
+ * 重写HTML中的相对路径资源为代理路径
+ * @param {string} html - 原始HTML内容
+ * @param {string} targetUrl - 目标URL（用于解析相对路径）
+ * @param {string} proxyOrigin - 代理服务域名
+ */
+function rewriteHtmlResources(html, targetUrl, proxyOrigin) {
+  const targetBaseUrl = new URL(targetUrl).origin;
+  
+  // 1. 重写所有资源路径（img/script/link等）
+  const resourcePatterns = [
+    { tag: 'img', attr: 'src' },
+    { tag: 'script', attr: 'src' },
+    { tag: 'link', attr: 'href', condition: el => el.rel === 'stylesheet' },
+    { tag: 'source', attr: 'src' },
+    { tag: 'video', attr: 'src' },
+    { tag: 'audio', attr: 'src' }
+  ];
+
+  // 2. 重写CSS中的url()引用
+  const cssUrlRegex = /url\((['"]?)([^'")]+)\1\)/g;
+  
+  // 3. 特殊处理：保留a标签的原始链接（避免无限代理）
+  const anchorRegex = /<a\s+([^>]*href\s*=\s*['"])([^'"]+)(['"][^>]*)>/gi;
+
+  return html
+    // 步骤1：重写HTML资源标签
+    .replace(/<([a-z]+)\s+[^>]*>/gi, (tagMatch, tagName) => {
+      const pattern = resourcePatterns.find(p => p.tag === tagName);
+      if (!pattern) return tagMatch;
+
+      return tagMatch.replace(
+        new RegExp(`(${pattern.attr}\\s*=\\s*['"])([^'"]+)['"]`, 'i'),
+        (match, prefix, resourceUrl) => {
+          // 跳过绝对URL和data:协议
+          if (/^https?:\/\//.test(resourceUrl) || resourceUrl.startsWith('data:')) {
+            return match;
+          }
+          
+          // 转换为绝对路径并通过代理
+          const absoluteUrl = new URL(resourceUrl, targetBaseUrl).href;
+          const proxyUrl = new URL(proxyOrigin);
+          proxyUrl.searchParams.set('url', absoluteUrl);
+          
+          return `${prefix}${proxyUrl.toString()}"`;
+        }
+      );
+    })
+    
+    // 步骤2：重写CSS中的url()
+    .replace(cssUrlRegex, (match, quote, urlPath) => {
+      if (/^https?:\/\//.test(urlPath) || urlPath.startsWith('data:')) return match;
+      
+      try {
+        const absoluteUrl = new URL(urlPath, targetBaseUrl).href;
+        const proxyUrl = new URL(proxyOrigin);
+        proxyUrl.searchParams.set('url', absoluteUrl);
+        return `url(${quote}${proxyUrl.toString()}${quote})`;
+      } catch {
+        return match; // 无效URL保持原样
+      }
+    })
+    
+    // 步骤3：保留a标签原始链接（不代理页面跳转）
+    .replace(anchorRegex, (match, prefix, href, suffix) => {
+      if (/^https?:\/\//.test(href) && !href.includes(proxyOrigin)) {
+        // 外部链接保持原样
+        return match;
+      }
+      // 本地链接转换为绝对路径（不通过代理）
+      try {
+        const absoluteUrl = new URL(href, targetBaseUrl).href;
+        return `<a${prefix}${absoluteUrl}${suffix}>`;
+      } catch {
+        return match;
+      }
+    });
 }
